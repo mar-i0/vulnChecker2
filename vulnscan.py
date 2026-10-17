@@ -195,14 +195,21 @@ def scan_nmap(targets, ports, pn=True):
         cmd.append("-Pn")
     cmd += ["-p", pl, "-oX", "-"] + targets
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=1800).stdout
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     except Exception as e:
-        print(f"[!] nmap falló ({e}); usando fallback Python", file=sys.stderr)
+        log("WARNING", f"no se pudo ejecutar nmap: {e}")
+        return None
+    out = p.stdout or ""
+    if not out.strip():
+        err = (p.stderr or "").strip().splitlines()
+        log("WARNING", f"nmap no devolvió XML (código {p.returncode}): "
+                       f"{err[-1] if err else 'sin stderr'}")
         return None
     res = {}
     try:
         root = ET.fromstring(out)
-    except ET.ParseError:
+    except ET.ParseError as e:
+        log("WARNING", f"no se pudo parsear la salida de nmap: {e}")
         return None
     for h in root.findall("host"):
         addr = h.find("address")
@@ -330,14 +337,19 @@ def main():
         log("INFO", f"objetivo: {', '.join(args.targets)} ({len(hosts)} host(s))")
 
     use_nmap = (not args.no_nmap) and shutil.which("nmap")
-    host_svcs = {}
+    host_svcs = None
     if use_nmap:
         if not args.json:
             log("INFO", "detectando servicios y versiones con nmap -sV...")
-        host_svcs = scan_nmap(args.targets, args.ports, pn=(len(hosts) <= 4)) or {}
-    if not host_svcs:  # fallback python (o nmap sin resultados)
-        if not args.json:
-            log("WARNING", "nmap no disponible o sin salida; usando sondeo TCP propio")
+        host_svcs = scan_nmap(args.targets, args.ports, pn=(len(hosts) <= 4))
+        # dict (aunque vacío) = nmap es autoritativo; None = nmap falló de verdad
+        if host_svcs is None and not args.json:
+            log("WARNING", "nmap falló; recurriendo a sondeo TCP propio")
+    elif not args.json:
+        reason = "nmap desactivado (--no-nmap)" if args.no_nmap else "nmap no está instalado"
+        log("WARNING", f"{reason}; usando sondeo TCP propio")
+    if host_svcs is None:  # nmap ausente o con error real -> fallback Python
+        host_svcs = {}
         for h in hosts:
             svcs = scan_python(h, args.ports, args.timeout)
             if svcs:
