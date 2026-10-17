@@ -241,7 +241,7 @@ def discover_hosts(targets, progress=True):
     xml.close()
     cmd = ["nmap", "-sn", "-T4", "-v", "--stats-every", "5s", "-oX", xml.name] + targets
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, bufsize=1)
     except Exception as e:
         log("WARNING", f"no se pudo ejecutar nmap (descubrimiento): {e}")
@@ -285,7 +285,7 @@ def scan_nmap(targets, ports, pn=True, progress=True):
     cmd += ["-p", pl, "-oX", xml.name] + targets
     try:
         # stderr->stdout: la salida de progreso viene por stdout; el XML va al fichero
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, bufsize=1)
     except Exception as e:
         log("WARNING", f"no se pudo ejecutar nmap: {e}")
