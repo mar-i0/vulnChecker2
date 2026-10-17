@@ -186,31 +186,58 @@ def scan_python(host, ports, timeout):
         found.append({"port": p, "name": "", "product": prod or "", "version": ver or ""})
     return found
 
-def scan_nmap(targets, ports, pn=True):
-    """Un solo nmap -sV sobre todos los objetivos. Devuelve {ip: [servicios]}.
-    pn=False deja que nmap descubra hosts (mejor para subredes)."""
+def _nmap_progress(line):
+    """Traduce una línea de nmap -v a un log legible (o None para ignorarla)."""
+    if "Discovered open port" in line:
+        return "INFO", "  " + line.split("Discovered ", 1)[1]        # open port 22/tcp on x
+    if line.startswith("Nmap scan report for"):
+        return "INFO", f"explorando {line.replace('Nmap scan report for', '').strip()}"
+    if line.startswith("Scanning ") and ("port" in line or "host" in line):
+        return "INFO", "  " + line
+    if "% done" in line:                                            # progreso + ETC
+        frag = line.split("About", 1)[-1].strip() if "About" in line else line
+        return "INFO", "  progreso: " + frag
+    if line.startswith("Initiating") and "Service scan" in line:
+        return "INFO", "  identificando versiones de servicio..."
+    return None
+
+def scan_nmap(targets, ports, pn=True, progress=True):
+    """nmap -sV sobre los objetivos, mostrando progreso en vivo.
+    Devuelve {ip: [servicios]}; None si nmap falla. pn=False -> nmap descubre hosts."""
+    import tempfile
     pl = ",".join(str(p) for p in ports)
-    cmd = ["nmap", "-sT", "-sV", "--version-light", "-T4"]
+    xml = tempfile.NamedTemporaryFile(prefix="vulnscan_", suffix=".xml", delete=False)
+    xml.close()
+    cmd = ["nmap", "-sT", "-sV", "--version-light", "-T4", "-v", "--stats-every", "6s"]
     if pn:
         cmd.append("-Pn")
-    cmd += ["-p", pl, "-oX", "-"] + targets
+    cmd += ["-p", pl, "-oX", xml.name] + targets
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        # stderr->stdout: la salida de progreso viene por stdout; el XML va al fichero
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
     except Exception as e:
         log("WARNING", f"no se pudo ejecutar nmap: {e}")
+        os.unlink(xml.name)
         return None
-    out = p.stdout or ""
-    if not out.strip():
-        err = (p.stderr or "").strip().splitlines()
-        log("WARNING", f"nmap no devolvió XML (código {p.returncode}): "
-                       f"{err[-1] if err else 'sin stderr'}")
-        return None
+    last = ""
+    for line in proc.stdout:
+        line = line.strip()
+        if progress and line:
+            p = _nmap_progress(line)
+            if p and line != last:          # evita repetir la misma línea de stats
+                log(p[0], p[1])
+                last = line
+    rc = proc.wait()
     res = {}
     try:
-        root = ET.fromstring(out)
-    except ET.ParseError as e:
-        log("WARNING", f"no se pudo parsear la salida de nmap: {e}")
+        root = ET.parse(xml.name).getroot()
+    except (ET.ParseError, FileNotFoundError) as e:
+        log("WARNING", f"nmap terminó (código {rc}) pero no se pudo leer su XML: {e}")
         return None
+    finally:
+        try: os.unlink(xml.name)
+        except OSError: pass
     for h in root.findall("host"):
         addr = h.find("address")
         ip = addr.get("addr") if addr is not None else None
@@ -341,7 +368,8 @@ def main():
     if use_nmap:
         if not args.json:
             log("INFO", "detectando servicios y versiones con nmap -sV...")
-        host_svcs = scan_nmap(args.targets, args.ports, pn=(len(hosts) <= 4))
+        host_svcs = scan_nmap(args.targets, args.ports, pn=(len(hosts) <= 4),
+                              progress=not args.json)
         # dict (aunque vacío) = nmap es autoritativo; None = nmap falló de verdad
         if host_svcs is None and not args.json:
             log("WARNING", "nmap falló; recurriendo a sondeo TCP propio")
