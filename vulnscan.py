@@ -191,6 +191,8 @@ def _nmap_progress(line):
     if "Discovered open port" in line:
         return "INFO", "  " + line.split("Discovered ", 1)[1]        # open port 22/tcp on x
     if line.startswith("Nmap scan report for"):
+        if "[host down]" in line:          # no ensuciar con hosts caídos
+            return None
         return "INFO", f"explorando {line.replace('Nmap scan report for', '').strip()}"
     if line.startswith("Scanning ") and ("port" in line or "host" in line):
         return "INFO", "  " + line
