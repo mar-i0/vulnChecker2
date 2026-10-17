@@ -16,7 +16,7 @@ Uso:
     python3 vulnscan.py host --no-nmap --json
 """
 import os, sys, socket, argparse, sqlite3, subprocess, ipaddress, re, json, shutil
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import xml.etree.ElementTree as ET
 
 try:
@@ -68,6 +68,37 @@ def log(level, msg):
 def sev_color(sev):
     return {"CRITICAL": c.bred + c.bold, "HIGH": c.red, "MEDIUM": c.byellow,
             "LOW": c.cyan}.get(sev, c.dim)
+
+def render_host(ip, host_out, idx, total, show_potential):
+    """Imprime los servicios y CVEs de UN host (en cuanto termina). Devuelve (nvulns, ncrit)."""
+    log("INFO", f"[{idx}/{total}] {c.bold}{ip}{c.reset}: {len(host_out)} servicio(s) abierto(s)")
+    nv = nc = 0
+    for entry in host_out:
+        s = entry["service"]
+        ver = f" {s['version']}" if s["version"] else ""
+        prod = s["product"] or s["name"] or "desconocido"
+        log("INFO", f"  {ip}:{c.bold}{s['port']}{c.reset} ejecuta {c.cyan}'{prod}{ver}'{c.reset}")
+        conf = entry["confirmed"]
+        if conf:
+            nv += len(conf)
+            ncrit = sum(1 for r in conf if (r["severity"] or "") == "CRITICAL")
+            nc += ncrit
+            log("CRITICAL" if ncrit else "WARNING",
+                f"  {c.bold}{len(conf)}{c.reset} CVE con la versión en rango (confirmados):")
+            for r in conf:
+                sc = f"{r['cvss']:.1f}" if r["cvss"] is not None else " ?  "
+                sv = r["severity"] or "N/A"
+                clr = sev_color(r["severity"])
+                av = (r["attack_vector"] or "")[:3].lower()
+                avm = f" {c.dim}[{av}]{c.reset}" if av else ""
+                print(f"        {clr}{sc:>4} {sv:<8}{c.reset} "
+                      f"{c.bold}{r['cve']}{c.reset}{avm}  {c.dim}{r['descr'][:66]}{c.reset}")
+        else:
+            log("INFO", f"      {c.dim}sin CVE confirmado por versión{c.reset}")
+        if show_potential and entry["potential"]:
+            log("DEBUG", f"      {len(entry['potential'])} potenciales "
+                         f"(producto coincide, versión no detectada)")
+    return nv, nc
 
 DEFAULT_PORTS = [21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 993, 995,
                  1521, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 9200, 27017]
@@ -406,9 +437,10 @@ def main():
         log("INFO", f"objetivo: {', '.join(args.targets)} ({len(hosts)} host(s))")
 
     use_nmap = (not args.no_nmap) and shutil.which("nmap")
-    host_svcs = None
+    # ---- decidir objetivos a escanear (FASE 1) y la función de escaneo ----
+    scan_fn = None
+    targets_list = []
     if use_nmap:
-        # FASE 1 — descubrir qué hosts están vivos (salvo --pn)
         if args.pn:
             live = hosts
             if not args.json:
@@ -417,82 +449,58 @@ def main():
             if not args.json:
                 log("INFO", f"fase 1: descubriendo hosts vivos en {len(hosts)} dirección(es)...")
             live = discover_hosts(args.targets, progress=not args.json)
-        # FASE 2 — escanear servicios/versiones SOLO de los vivos
         if live is None:                    # el descubrimiento falló de verdad
             if not args.json:
-                log("WARNING", "nmap (descubrimiento) falló; recurriendo a sondeo TCP propio")
+                log("WARNING", "nmap (descubrimiento) falló; usando sondeo TCP propio")
+            targets_list = hosts
+            scan_fn = lambda h: scan_python(h, args.ports, args.timeout)
         else:
             if not args.json:
                 log("INFO", f"fase 1 completa: {c.bold}{len(live)}{c.reset} host(s) vivo(s)")
-            if live:
-                if not args.json:
-                    log("INFO", f"fase 2: escaneando servicios y versiones en "
-                                f"{len(live)} host(s) vivo(s)...")
-                host_svcs = scan_nmap(live, args.ports, pn=True, progress=not args.json)
-                if host_svcs is None and not args.json:
-                    log("WARNING", "nmap (versión) falló; recurriendo a sondeo TCP propio")
-            else:
-                host_svcs = {}              # nmap autoritativo: ningún host vivo
-    elif not args.json:
-        reason = "nmap desactivado (--no-nmap)" if args.no_nmap else "nmap no está instalado"
-        log("WARNING", f"{reason}; usando sondeo TCP propio")
-    if host_svcs is None:  # nmap ausente o con error real -> fallback Python
-        host_svcs = {}
-        for h in hosts:
-            svcs = scan_python(h, args.ports, args.timeout)
-            if svcs:
-                host_svcs[h] = svcs
+            targets_list = live
+            # escaneo de versión por host (así podemos pintar hallazgos en cuanto acaba cada uno)
+            scan_fn = lambda h: next(iter((scan_nmap([h], args.ports, pn=True,
+                                                     progress=False) or {}).values()), [])
+    else:
+        if not args.json:
+            reason = "nmap desactivado (--no-nmap)" if args.no_nmap else "nmap no está instalado"
+            log("WARNING", f"{reason}; usando sondeo TCP propio")
+        targets_list = hosts
+        scan_fn = lambda h: scan_python(h, args.ports, args.timeout)
 
-    if not args.json:
-        log("INFO", f"{len(host_svcs)} host(s) con servicios abiertos; "
-                    f"analizando vulnerabilidades")
+    if not args.json and targets_list:
+        log("INFO", f"fase 2: escaneando servicios y versiones en {len(targets_list)} host(s)...")
 
+    # ---- FASE 2: escaneo concurrente; se pintan los CVEs de cada host al terminar ----
     report = {}
-    for ip, svcs in sorted(host_svcs.items()):
-        host_out = []
-        for svc in svcs:
-            conf, pot = match_service(con, svc, args.min_cvss)
-            host_out.append({"service": svc, "confirmed": conf[:args.top],
-                             "potential": pot[:args.top]})
-        report[ip] = host_out
+    total_vulns = total_crit = 0
+    done = 0
+    if targets_list:
+        with ThreadPoolExecutor(max_workers=min(12, len(targets_list))) as ex:
+            futs = {ex.submit(scan_fn, h): h for h in targets_list}
+            for fut in as_completed(futs):
+                h = futs[fut]
+                done += 1
+                try:
+                    svcs = fut.result() or []
+                except Exception:
+                    svcs = []
+                if not svcs:
+                    continue
+                host_out = []
+                for svc in svcs:
+                    conf, pot = match_service(con, svc, args.min_cvss)
+                    host_out.append({"service": svc, "confirmed": conf[:args.top],
+                                     "potential": pot[:args.top]})
+                report[h] = host_out
+                if not args.json:
+                    nv, nc = render_host(h, host_out, done, len(targets_list), args.show_potential)
+                    total_vulns += nv
+                    total_crit += nc
 
     if args.json:
         print(json.dumps(report, indent=2, default=str))
         return
-
-    # ---- salida legible estilo sqlmap ----
-    total_vulns = total_crit = 0
-    for ip in sorted(report):
-        host_out = report[ip]
-        n_open = len(host_out)
-        log("INFO", f"host {c.bold}{ip}{c.reset} responde con {n_open} servicio(s) abierto(s)")
-        for entry in host_out:
-            s = entry["service"]
-            ver = f" {s['version']}" if s["version"] else ""
-            prod = s["product"] or s["name"] or "desconocido"
-            log("INFO", f"  {ip}:{c.bold}{s['port']}{c.reset} ejecuta "
-                        f"{c.cyan}'{prod}{ver}'{c.reset}")
-            conf = entry["confirmed"]
-            if conf:
-                total_vulns += len(conf)
-                ncrit = sum(1 for r in conf if (r["severity"] or "") == "CRITICAL")
-                total_crit += ncrit
-                lvl = "CRITICAL" if ncrit else "WARNING"
-                log(lvl, f"  {c.bold}{len(conf)}{c.reset} CVE con la versión en rango "
-                         f"(confirmados):")
-                for r in conf:
-                    sc = f"{r['cvss']:.1f}" if r["cvss"] is not None else " ?  "
-                    sv = r["severity"] or "N/A"
-                    clr = sev_color(r["severity"])
-                    av = (r["attack_vector"] or "")[:3].lower()
-                    avm = f" {c.dim}[{av}]{c.reset}" if av else ""
-                    print(f"        {clr}{sc:>4} {sv:<8}{c.reset} "
-                          f"{c.bold}{r['cve']}{c.reset}{avm}  {c.dim}{r['descr'][:66]}{c.reset}")
-            else:
-                log("INFO", f"      {c.dim}sin CVE confirmado por versión{c.reset}")
-            if args.show_potential and entry["potential"]:
-                log("DEBUG", f"      {len(entry['potential'])} potenciales "
-                             f"(producto coincide, versión no detectada)")
 
     print()
     if total_vulns:
