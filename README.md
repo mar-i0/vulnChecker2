@@ -90,6 +90,20 @@ python3 vulnscan.py host --json > salida.json
 CVE coloreada. El color se apaga solo si no hay TTY, con `--no-color` o `NO_COLOR`;
 `--color` lo fuerza (p.ej. para `| less -R`).
 
+### 💥 Cruce con ExploitDB
+
+El índice incluye una tabla `exploit` que mapea cada CVE a los exploits públicos
+conocidos (datos de [exploit-db](https://gitlab.com/exploit-database/exploitdb):
+25.091 CVEs con exploit). En el escaneo, los CVE con exploit se marcan en vivo
+(`►EXPLOIT: EDB-50406, ...`) y aparecen en la columna **EXPLOIT** de la tabla final.
+
+Para regenerar/actualizar ese cruce (ya viene hecho en el índice del repo):
+
+```bash
+# descarga el CSV oficial (o usa el que viene en el repo) y rellena la tabla 'exploit'
+python3 add_exploits.py --csv files_exploits.csv --db cve_index.sqlite
+```
+
 ### Opciones
 
 ```

@@ -99,8 +99,9 @@ def resolve_db(db):
         return dest
     return None
 
-def print_table(headers, rows, color_col=None, color_fn=None):
-    """Imprime una tabla ASCII con bordes. color_col/color_fn colorean una columna."""
+def print_table(headers, rows, color_map=None):
+    """Imprime una tabla ASCII con bordes. color_map = {indice_columna: fn(valor)->ansi}."""
+    color_map = color_map or {}
     widths = [len(h) for h in headers]
     for r in rows:
         for i, cell in enumerate(r):
@@ -112,8 +113,10 @@ def print_table(headers, rows, color_col=None, color_fn=None):
             padded = cell.ljust(widths[i])
             if head:
                 padded = f"{c.bold}{padded}{c.reset}"
-            elif color_col is not None and i == color_col and color_fn:
-                padded = f"{color_fn(cell)}{padded}{c.reset}"
+            elif i in color_map:
+                clr = color_map[i](cell)
+                if clr:
+                    padded = f"{clr}{padded}{c.reset}"
             out.append(" " + padded + " ")
         return "|" + "|".join(out) + "|"
     print(sep)
@@ -135,24 +138,37 @@ def summary_table(report):
     if not items:
         return
     items.sort(key=lambda x: -x[0])
-    headers = ["HOST", "PUERTO", "SERVICIO", "CVE", "CVSS", "SEVERIDAD", "VECTOR", "DESCRIPCIÓN"]
+    headers = ["HOST", "PUERTO", "SERVICIO", "CVE", "CVSS", "SEVERIDAD", "VECTOR",
+               "EXPLOIT", "DESCRIPCIÓN"]
     rows = []
     for cvss, ip, port, prod, r in items:
         descr = (r["descr"] or "").strip()
+        exps = r.get("exploits") or []
+        if exps:
+            exploit = "EDB-" + exps[0]["edb_id"] + (f" +{len(exps)-1}" if len(exps) > 1 else "")
+        else:
+            exploit = "-"
         rows.append([
             ip, str(port), prod[:20], r["cve"],
             (f"{r['cvss']:.1f}" if r["cvss"] is not None else "?"),
             (r["severity"] or "N/A"),
             ((r["attack_vector"] or "")[:3].lower() or "-"),
-            (descr[:50] + "…" if len(descr) > 50 else descr),
+            exploit,
+            (descr[:46] + "…" if len(descr) > 46 else descr),
         ])
-    print(f"\n{c.bold}RESUMEN DE VULNERABILIDADES CONFIRMADAS ({len(items)}){c.reset}")
-    print_table(headers, rows, color_col=5, color_fn=sev_color)
+    n_exp = sum(1 for _, _, _, _, r in items if r.get("exploits"))
+    title = f"RESUMEN DE VULNERABILIDADES CONFIRMADAS ({len(items)}"
+    title += f", {n_exp} con exploit público)" if n_exp else ")"
+    print(f"\n{c.bold}{title}{c.reset}")
+    print_table(headers, rows, color_map={
+        5: sev_color,
+        7: lambda v: (c.bred + c.bold) if v != "-" else c.dim,
+    })
 
 def render_host(ip, host_out, idx, total, show_potential):
     """Imprime los servicios y CVEs de UN host (en cuanto termina). Devuelve (nvulns, ncrit)."""
     log("INFO", f"[{idx}/{total}] {c.bold}{ip}{c.reset}: {len(host_out)} servicio(s) abierto(s)")
-    nv = nc = 0
+    nv = nc = ne = 0
     for entry in host_out:
         s = entry["service"]
         ver = f" {s['version']}" if s["version"] else ""
@@ -171,14 +187,21 @@ def render_host(ip, host_out, idx, total, show_potential):
                 clr = sev_color(r["severity"])
                 av = (r["attack_vector"] or "")[:3].lower()
                 avm = f" {c.dim}[{av}]{c.reset}" if av else ""
+                exps = r.get("exploits") or []
+                xm = ""
+                if exps:
+                    ne += 1
+                    ids = ", ".join("EDB-" + e["edb_id"] for e in exps[:3])
+                    extra = f" +{len(exps)-3}" if len(exps) > 3 else ""
+                    xm = f" {c.bred}{c.bold}►EXPLOIT: {ids}{extra}{c.reset}"
                 print(f"        {clr}{sc:>4} {sv:<8}{c.reset} "
-                      f"{c.bold}{r['cve']}{c.reset}{avm}  {c.dim}{r['descr'][:66]}{c.reset}")
+                      f"{c.bold}{r['cve']}{c.reset}{avm}{xm}  {c.dim}{r['descr'][:60]}{c.reset}")
         else:
             log("INFO", f"      {c.dim}sin CVE confirmado por versión{c.reset}")
         if show_potential and entry["potential"]:
             log("DEBUG", f"      {len(entry['potential'])} potenciales "
                          f"(producto coincide, versión no detectada)")
-    return nv, nc
+    return nv, nc, ne
 
 DEFAULT_PORTS = [21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 993, 995,
                  1521, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 9200, 27017]
@@ -413,6 +436,23 @@ def scan_nmap(targets, ports, pn=True, progress=True):
     return res
 
 # ---------- matching contra el índice ----------
+_HAS_EXPLOIT = None
+def exploits_for(con, cve):
+    """Lista de exploits públicos (ExploitDB) para un CVE; [] si no hay tabla o no hay."""
+    global _HAS_EXPLOIT
+    if _HAS_EXPLOIT is None:
+        _HAS_EXPLOIT = bool(con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='exploit'").fetchone())
+    if not _HAS_EXPLOIT:
+        return []
+    out = []
+    for row in con.execute(
+            "SELECT edb_id,type,platform,title,verified FROM exploit "
+            "WHERE cve_id=? ORDER BY verified DESC, edb_id LIMIT 10", (cve,)):
+        out.append({"edb_id": row[0], "type": row[1], "platform": row[2],
+                    "title": row[3], "verified": row[4]})
+    return out
+
 def match_service(con, svc, min_cvss):
     cvendor = cproduct = cver = ""
     for cpe in svc.get("cpe", []):
@@ -469,7 +509,10 @@ def match_service(con, svc, min_cvss):
             if k not in best or (r["cvss"] or 0) > (best[k]["cvss"] or 0):
                 best[k] = r
         return sorted(best.values(), key=lambda r: (r["cvss"] or 0), reverse=True)
-    return dedup(confirmed), dedup(potential)
+    conf = dedup(confirmed)
+    for rec in conf:                      # ¿hay exploit público para este CVE?
+        rec["exploits"] = exploits_for(con, rec["cve"])
+    return conf, dedup(potential)
 
 # ---------- main ----------
 def expand(target):
@@ -555,7 +598,7 @@ def main():
 
     # ---- FASE 2: escaneo concurrente; se pintan los CVEs de cada host al terminar ----
     report = {}
-    total_vulns = total_crit = 0
+    total_vulns = total_crit = total_exp = 0
     done = 0
     if targets_list:
         with ThreadPoolExecutor(max_workers=min(12, len(targets_list))) as ex:
@@ -576,9 +619,10 @@ def main():
                                      "potential": pot[:args.top]})
                 report[h] = host_out
                 if not args.json:
-                    nv, nc = render_host(h, host_out, done, len(targets_list), args.show_potential)
+                    nv, nc, ne = render_host(h, host_out, done, len(targets_list), args.show_potential)
                     total_vulns += nv
                     total_crit += nc
+                    total_exp += ne
 
     if args.json:
         print(json.dumps(report, indent=2, default=str))
@@ -591,7 +635,8 @@ def main():
     if total_vulns:
         log("CRITICAL" if total_crit else "WARNING",
             f"{c.bold}{total_vulns}{c.reset} vulnerabilidad(es) confirmada(s) "
-            f"en {len(report)} host(s) — {c.bred}{total_crit} crítica(s){c.reset}")
+            f"en {len(report)} host(s) — {c.bred}{total_crit} crítica(s){c.reset}, "
+            f"{c.bred}{c.bold}{total_exp} con exploit público{c.reset}")
     else:
         log("INFO", f"{c.bgreen}sin vulnerabilidades confirmadas por versión{c.reset}")
     log("INFO", f"finalizado en {ts()}")
