@@ -203,6 +203,44 @@ def _nmap_progress(line):
         return "INFO", "  identificando versiones de servicio..."
     return None
 
+def discover_hosts(targets, progress=True):
+    """FASE 1: descubrimiento rápido (nmap -sn). Devuelve lista de IPs vivas, o None si falla."""
+    import tempfile
+    xml = tempfile.NamedTemporaryFile(prefix="vulnscan_disc_", suffix=".xml", delete=False)
+    xml.close()
+    cmd = ["nmap", "-sn", "-T4", "-v", "--stats-every", "5s", "-oX", xml.name] + targets
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
+    except Exception as e:
+        log("WARNING", f"no se pudo ejecutar nmap (descubrimiento): {e}")
+        try: os.unlink(xml.name)
+        except OSError: pass
+        return None
+    for line in proc.stdout:
+        line = line.strip()
+        if progress and line.startswith("Nmap scan report for") and "[host down]" not in line:
+            log("INFO", f"  vivo: {line.replace('Nmap scan report for', '').strip()}")
+        elif progress and "% done" in line:
+            frag = line.split("About", 1)[-1].strip() if "About" in line else line
+            log("INFO", "  descubrimiento: " + frag)
+    proc.wait()
+    try:
+        root = ET.parse(xml.name).getroot()
+    except (ET.ParseError, FileNotFoundError) as e:
+        log("WARNING", f"no se pudo leer el descubrimiento de nmap: {e}")
+        return None
+    finally:
+        try: os.unlink(xml.name)
+        except OSError: pass
+    live = []
+    for h in root.findall("host"):
+        st = h.find("status")
+        addr = h.find("address")
+        if st is not None and st.get("state") == "up" and addr is not None and addr.get("addr"):
+            live.append(addr.get("addr"))
+    return live
+
 def scan_nmap(targets, ports, pn=True, progress=True):
     """nmap -sV sobre los objetivos, mostrando progreso en vivo.
     Devuelve {ip: [servicios]}; None si nmap falla. pn=False -> nmap descubre hosts."""
@@ -340,6 +378,8 @@ def main():
     ap.add_argument("--top", type=int, default=15, help="máx. CVEs por servicio")
     ap.add_argument("--show-potential", action="store_true", help="mostrar coincidencias sin versión")
     ap.add_argument("--no-nmap", action="store_true")
+    ap.add_argument("--pn", action="store_true",
+                    help="saltar descubrimiento y tratar todos los hosts como vivos (nmap -Pn)")
     ap.add_argument("--no-color", action="store_true")
     ap.add_argument("--color", action="store_true", help="forzar color aunque no haya TTY")
     ap.add_argument("--timeout", type=float, default=1.0)
@@ -368,13 +408,31 @@ def main():
     use_nmap = (not args.no_nmap) and shutil.which("nmap")
     host_svcs = None
     if use_nmap:
-        if not args.json:
-            log("INFO", "detectando servicios y versiones con nmap -sV...")
-        host_svcs = scan_nmap(args.targets, args.ports, pn=(len(hosts) <= 4),
-                              progress=not args.json)
-        # dict (aunque vacío) = nmap es autoritativo; None = nmap falló de verdad
-        if host_svcs is None and not args.json:
-            log("WARNING", "nmap falló; recurriendo a sondeo TCP propio")
+        # FASE 1 — descubrir qué hosts están vivos (salvo --pn)
+        if args.pn:
+            live = hosts
+            if not args.json:
+                log("INFO", "descubrimiento omitido (--pn): trato todos como vivos")
+        else:
+            if not args.json:
+                log("INFO", f"fase 1: descubriendo hosts vivos en {len(hosts)} dirección(es)...")
+            live = discover_hosts(args.targets, progress=not args.json)
+        # FASE 2 — escanear servicios/versiones SOLO de los vivos
+        if live is None:                    # el descubrimiento falló de verdad
+            if not args.json:
+                log("WARNING", "nmap (descubrimiento) falló; recurriendo a sondeo TCP propio")
+        else:
+            if not args.json:
+                log("INFO", f"fase 1 completa: {c.bold}{len(live)}{c.reset} host(s) vivo(s)")
+            if live:
+                if not args.json:
+                    log("INFO", f"fase 2: escaneando servicios y versiones en "
+                                f"{len(live)} host(s) vivo(s)...")
+                host_svcs = scan_nmap(live, args.ports, pn=True, progress=not args.json)
+                if host_svcs is None and not args.json:
+                    log("WARNING", "nmap (versión) falló; recurriendo a sondeo TCP propio")
+            else:
+                host_svcs = {}              # nmap autoritativo: ningún host vivo
     elif not args.json:
         reason = "nmap desactivado (--no-nmap)" if args.no_nmap else "nmap no está instalado"
         log("WARNING", f"{reason}; usando sondeo TCP propio")
