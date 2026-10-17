@@ -28,17 +28,30 @@ falsos positivos. La **v2** sustituye ese motor por dos piezas:
 
 ## 🚀 Motor v2 — uso rápido
 
-### 1) Construir el índice (una vez)
+### El índice viaja con el repo (se despliega solo)
 
-Necesita la base oficial de CVE descomprimida en `cvelistV5-main/cves/`
-(fuente: <https://github.com/CVEProject/cvelistV5>).
+La base de datos (309.826 CVEs, ~430 MB) se incluye **comprimida** en el repo como
+`cve_index.sqlite.xz` (~30 MB). **No hace falta construirla**: en el primer escaneo,
+`vulnscan.py` detecta que falta el `.sqlite`, descomprime el `.xz` que está junto al
+script y lo despliega ahí automáticamente. Las siguientes ejecuciones ya lo reutilizan.
+
+```bash
+git clone https://github.com/mar-i0/vulnChecker2.git
+cd vulnChecker2
+python3 vulnscan.py 192.168.1.0/24      # el primer uso despliega el índice y escanea
+```
+
+### (Opcional) Reconstruir el índice desde cero
+
+Solo si quieres regenerarlo con datos más nuevos. Necesita la base oficial de CVE
+descomprimida en `cvelistV5-main/cves/` (<https://github.com/CVEProject/cvelistV5>).
 
 ```bash
 python3 build_index.py --src cvelistV5-main/cves --db cve_index.sqlite
 # -> 309.826 CVEs, 866.373 filas, ~430 MB
 ```
 
-### 2) Escanear
+### Escanear
 
 ```bash
 # Un host

@@ -15,7 +15,7 @@ Uso:
     python3 vulnscan.py 10.0.0.5 --min-cvss 7 --show-potential
     python3 vulnscan.py host --no-nmap --json
 """
-import os, sys, socket, argparse, sqlite3, subprocess, ipaddress, re, json, shutil
+import os, sys, socket, argparse, sqlite3, subprocess, ipaddress, re, json, shutil, gzip, lzma
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import xml.etree.ElementTree as ET
 
@@ -68,6 +68,36 @@ def log(level, msg):
 def sev_color(sev):
     return {"CRITICAL": c.bred + c.bold, "HIGH": c.red, "MEDIUM": c.byellow,
             "LOW": c.cyan}.get(sev, c.dim)
+
+def resolve_db(db):
+    """Devuelve una ruta a la BBDD lista para usar. Si no existe el .sqlite pero
+    sí el comprimido que viaja en el repo (.xz/.gz), lo despliega en el primer uso."""
+    if os.path.exists(db):
+        return db
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = [db + ".xz", os.path.join(here, "cve_index.sqlite.xz"),
+             db + ".gz", os.path.join(here, "cve_index.sqlite.gz")]
+    for src in cands:
+        if not os.path.exists(src):
+            continue
+        dest = src.rsplit(".", 1)[0]          # quita .xz/.gz
+        if not os.path.exists(dest):
+            opener = lzma.open if src.endswith(".xz") else gzip.open
+            log("INFO", f"primer uso: desplegando el índice CVE desde "
+                        f"{os.path.basename(src)} (descomprimiendo, aguarda unos segundos)...")
+            tmp = dest + ".tmp"
+            try:
+                with opener(src, "rb") as fi, open(tmp, "wb") as fo:
+                    shutil.copyfileobj(fi, fo, 1024 * 1024)
+                os.replace(tmp, dest)
+            except OSError as e:              # p.ej. destino no escribible
+                log("WARNING", f"no pude desplegar en {dest}: {e}")
+                try: os.unlink(tmp)
+                except OSError: pass
+                continue
+            log("INFO", f"índice desplegado: {dest}")
+        return dest
+    return None
 
 def render_host(ip, host_out, idx, total, show_potential):
     """Imprime los servicios y CVEs de UN host (en cuanto termina). Devuelve (nvulns, ncrit)."""
@@ -422,9 +452,11 @@ def main():
     if not args.json:
         banner()
 
-    if not os.path.exists(args.db):
-        sys.exit(f"[!] No existe el índice {args.db}. Ejecuta build_index.py primero.")
-    con = sqlite3.connect(args.db)
+    db = resolve_db(args.db)
+    if not db:
+        sys.exit(f"[!] No encuentro el índice ({args.db}) ni un .xz/.gz para desplegarlo. "
+                 f"Ejecuta build_index.py o clona el repo completo.")
+    con = sqlite3.connect(db)
     nsig = con.execute("SELECT COUNT(*) FROM vuln").fetchone()[0]
 
     hosts = []
