@@ -99,6 +99,56 @@ def resolve_db(db):
         return dest
     return None
 
+def print_table(headers, rows, color_col=None, color_fn=None):
+    """Imprime una tabla ASCII con bordes. color_col/color_fn colorean una columna."""
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(cell))
+    sep = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+    def fmt(cells, head=False):
+        out = []
+        for i, cell in enumerate(cells):
+            padded = cell.ljust(widths[i])
+            if head:
+                padded = f"{c.bold}{padded}{c.reset}"
+            elif color_col is not None and i == color_col and color_fn:
+                padded = f"{color_fn(cell)}{padded}{c.reset}"
+            out.append(" " + padded + " ")
+        return "|" + "|".join(out) + "|"
+    print(sep)
+    print(fmt(headers, head=True))
+    print(sep)
+    for r in rows:
+        print(fmt(r))
+    print(sep)
+
+def summary_table(report):
+    """Tabla-resumen final con todas las vulnerabilidades confirmadas (orden por CVSS)."""
+    items = []
+    for ip in report:
+        for entry in report[ip]:
+            s = entry["service"]
+            prod = s["product"] or s["name"] or "?"
+            for r in entry["confirmed"]:
+                items.append((r["cvss"] if r["cvss"] is not None else -1.0, ip, s["port"], prod, r))
+    if not items:
+        return
+    items.sort(key=lambda x: -x[0])
+    headers = ["HOST", "PUERTO", "SERVICIO", "CVE", "CVSS", "SEVERIDAD", "VECTOR", "DESCRIPCIÓN"]
+    rows = []
+    for cvss, ip, port, prod, r in items:
+        descr = (r["descr"] or "").strip()
+        rows.append([
+            ip, str(port), prod[:20], r["cve"],
+            (f"{r['cvss']:.1f}" if r["cvss"] is not None else "?"),
+            (r["severity"] or "N/A"),
+            ((r["attack_vector"] or "")[:3].lower() or "-"),
+            (descr[:50] + "…" if len(descr) > 50 else descr),
+        ])
+    print(f"\n{c.bold}RESUMEN DE VULNERABILIDADES CONFIRMADAS ({len(items)}){c.reset}")
+    print_table(headers, rows, color_col=5, color_fn=sev_color)
+
 def render_host(ip, host_out, idx, total, show_potential):
     """Imprime los servicios y CVEs de UN host (en cuanto termina). Devuelve (nvulns, ncrit)."""
     log("INFO", f"[{idx}/{total}] {c.bold}{ip}{c.reset}: {len(host_out)} servicio(s) abierto(s)")
@@ -533,6 +583,9 @@ def main():
     if args.json:
         print(json.dumps(report, indent=2, default=str))
         return
+
+    if total_vulns:
+        summary_table(report)
 
     print()
     if total_vulns:
