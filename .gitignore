@@ -1,0 +1,13 @@
+# Datos/artefactos regenerables (no van a git)
+cve_index.sqlite
+*.sqlite
+main.zip
+cvelistV5-main/
+cve_scripts_*/
+cve_checker_scripts/
+cve_checker_scripts_*/
+CVE_ENRIQUECIDO*.json
+CVE_AGENTE_DETECCION.json
+*.pdf
+__pycache__/
+*.pyc
